@@ -19,6 +19,53 @@ Pair-wise GSB 标注任务仓库（第 17 批 / 287）。
 ./mvnw -q verify
 ```
 
+## 组件说明（本次实现）
+
+包：`com.example.gsb.timeline`。核心流程：
+
+1. **读取**：`LogSource`（内存列表 / 行格式 / 文件）产出 `LogEntry`
+   （来源、时间戳、`requestId`、`spanId`、`parentSpanId`）。
+2. **因果提取**：`CausalityExtractor` 建立 happens-before 图——
+   显式标记（`parentSpanId -> spanId`）+ 同来源同请求按本地读取顺序衔接。
+3. **偏移估计**：`ClockOffsetEstimator` 对每条跨来源因果边 a->b 观测
+   `delta = t(b) - t(a)`，在"单跳时延 ∈ [0, maxHopDelay]"假设下得到差约束
+   `offset(b) ∈ [offset(a) + delta - D, offset(a) + delta]`；同一来源对取中位数抗噪，
+   以基准来源 offset=0 为锚点用 Bellman-Ford 解出各来源偏移区间，点估计取区间中点。
+4. **时间线重建**：`TimelineReconstructor` 做因果约束优先的拓扑排序
+   （就绪集合中按校正时间取最早者），因此同一请求的因果顺序**绝不会**被时间戳颠倒。
+5. **不确定性标注**：线性化序列上，彼此无因果先后且校正区间重叠的相邻条目
+   合并为 `TimelineNode.Concurrent` 并发组，不做任意排序；区间不重叠则先后确定。
+6. **统计**：`TimelineStats` 输出条目数、来源数、各来源偏移估计、
+   被纠正的顺序数（原始时间戳颠倒但被因果摆正的边数）、并发组数、不可校正来源。
+
+```java
+Timeline timeline = new TimelineReconstructor(Duration.ofMillis(20), "gateway")
+        .reconstruct(List.of(sourceA, sourceB, sourceC));
+timeline.nodes();  // Ordered / Concurrent 节点序列
+timeline.stats();  // 统计
+```
+
+### 局限性
+
+- **因果标记不足时无法校正**：某来源与基准来源之间若没有跨来源因果标记链，
+  其偏移完全不可观测，只能按 0 处理并计入 `uncorrectableSources`；
+  其条目与其他来源的先后关系只能标注为不确定（并发组），不会凭空猜测。
+- 偏移估计的是**区间**而非精确值：区间宽度 ≈ 标记路径上各跳时延的不确定性之和，
+  跳数越多、`maxHopDelay` 越保守，区间越宽。
+- 估计假设观察窗口内各来源时钟**漂移可忽略**（偏移为常数）；
+  若标记自相矛盾（负环）会抛出异常，提示标记或 `maxHopDelay` 假设有误。
+- 并发分组是线性化序列上的相邻分组，是偏序关系的一种可读近似，
+  不枚举所有可能的线性扩展。
+
+### 最小因果标记量建议
+
+- **下限**：每个非基准来源至少 1 条跨源因果边把它连到基准所在的约束连通分量，
+  否则完全无法校正。
+- **可用**：每个来源对至少 2 条边且**双向各 ≥1 条**（一次请求往返），
+  才能得到双侧有界的偏移区间；单向边只能给出单侧界。
+- **建议**：每个来源对 ≥5 条标记，使中位数聚合能抑制个别离群标记
+  （如重试、排队造成的异常时延）；标记应均匀分布在整个观察窗口内。
+
 ## 任务提示词
 
 以下为本题完整的 User Prompt 原文，两次执行必须使用完全相同的文本。
